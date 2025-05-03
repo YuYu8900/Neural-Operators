@@ -1,0 +1,309 @@
+""
+import os
+os.environ['CUDA_VISIBLE_DEVICES']='1'
+import torch.nn.functional as F
+from timeit import default_timer
+from utilities3 import *
+from losses import LpLoss,DR_loss
+from torch.autograd import Variable
+
+# torch.manual_seed(0)
+# np.random.seed(0)
+
+
+################################################################
+#  1d fourier layer
+################################################################
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super(SpectralConv2d, self).__init__()
+
+        """
+        2D Fourier layer. It does FFT, linear transform, and Inverse FFT.
+        """
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1  # Number of Fourier modes to multiply, at most floor(N/2) + 1
+        self.modes2 = modes2
+
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+
+    # Complex multiplication
+    def compl_mul2d(self, input, weights):
+        # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        # Compute Fourier coeffcients up to factor of e^(- something constant)
+        x_ft = torch.fft.rfft2(x)
+
+        # Multiply relevant Fourier modes
+        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-2), x.size(-1) // 2 + 1, dtype=torch.cfloat,
+                             device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2] = \
+            self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2] = \
+            self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+
+        # Return to physical space
+        x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+
+class FNO2D(nn.Module):
+    def __init__(self, modes1, modes2, width, n_layers):
+        super().__init__()
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.width = width
+        self.padding = 7  # pad the domain if input is non-periodic
+        self.fc0 = nn.Linear(3, self.width)  # input channel is 3: (a(x, y), x, y)
+        self.n_layers = n_layers
+
+        self.convs = nn.ModuleList([])
+        self.ws = nn.ModuleList([])
+        for _ in range(n_layers):
+            conv = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+            self.convs.append(conv)
+
+            w = nn.Conv2d(self.width, self.width, 1)
+            self.ws.append(w)
+
+        self.fc1 = nn.Linear(self.width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        grid = self.get_grid(x.shape, x.device)
+        x = torch.cat((x, grid), dim=-1)
+        x = self.fc0(x)
+        x = x.permute(0, 3, 1,2)
+
+        x = F.pad(x, [0, self.padding, 0, self.padding])
+
+        for i in range(self.n_layers):
+            x1 = self.convs[i](x)
+            x2 = self.ws[i](x)
+            x = x1 + x2
+            if i < self.n_layers - 1:
+                x = F.gelu(x)
+
+        x = x[..., :-self.padding, :-self.padding]
+        x = x.permute(0, 2, 3, 1)
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+        return x
+
+    def get_grid(self, shape, device):
+        batchsize, size_x, size_y = shape[0], shape[1], shape[2]
+        gridx = torch.tensor(np.linspace(0, 1, size_x), dtype=torch.float)
+        gridx = gridx.reshape(1, size_x, 1, 1).repeat([batchsize, 1, size_y, 1])
+        gridy = torch.tensor(np.linspace(0, 1, size_y), dtype=torch.float)
+        gridy = gridy.reshape(1, 1, size_y, 1).repeat([batchsize, size_x, 1, 1])
+        return torch.cat((gridx, gridy), dim=-1).to(device)
+
+
+################################################################
+#  configurations
+################################################################
+ntrain = 800
+ntest = 200
+
+nx = 100
+nt = 100
+sub = 1
+sub_t = 1
+s = nt
+
+batch_size = 20
+learning_rate = 0.001
+
+epochs = 500
+step_size = 50
+gamma = 0.5
+
+modes = 16
+width = 64#32
+n_layers=4
+
+#0，1，1
+#5，1，1
+data_weight = 5
+f_weight = 1
+ic_weight = 1
+
+################################################################
+# read data
+################################################################
+
+# Data is of the shape (number of samples, grid size)
+dataloader = MatReader('Diffusion_reaction_1200_100_100_0.2.mat')
+x_data = dataloader.read_field('u')
+y_data = dataloader.read_field('UU')
+# x = dataloader.read_field('x')
+x_train = x_data[:ntrain,:].reshape(ntrain, nx, 1,1).repeat([1, 1, s,1])
+y_train = y_data[:ntrain,:,:]
+
+x_test = x_data[-ntest:,:].reshape(ntest, nx, 1,1).repeat([1, 1, s,1])
+y_test = y_data[-ntest:,:,:]
+
+train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=False)
+
+# model
+model = FNO2D(modes,modes, width,n_layers).cuda()
+print(count_params(model))
+
+################################################################
+# training and evaluation
+################################################################
+# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+
+myloss = LpLoss(size_average=True)
+for ep in range(epochs):
+    model.train()
+    t1 = default_timer()
+    train_pino = 0.0
+    data_l2 = 0.0
+    train_loss = 0.0
+    # dataloader_iterator = iter(train_loader2)
+    for x, y in train_loader: 
+        x, y = x.cuda(), y.cuda()
+        x1,y1 = x[:,::4,::4],y[:,::4,::4] #PDE
+        x2,y2 = x[:,::4,::4],y[:,::4,::4] #Data
+
+        optimizer.zero_grad()
+        out = model(x2)
+        # mse = F.mse_loss(out.view(batch_size, -1), y.view(batch_size, -1), reduction='mean')
+
+        data_loss = myloss(out, y2)
+        if ic_weight != 0 or f_weight != 0:
+            out1 = model(x1)
+            loss_ic, loss_f = DR_loss(out1, x1[:, :, 0, 0])
+            # loss_ic, loss_f = burgers_loss(out, x[:, 0, :, 0], v)
+            train_pino += loss_f.item()
+        else:
+            loss_ic, loss_f = 0, 0
+
+        total_loss = loss_ic * ic_weight + loss_f * f_weight + data_loss * data_weight
+        
+        total_loss.backward() # use the l2 relative loss
+
+        optimizer.step()
+        # train_mse += mse.item()
+        data_l2 += data_loss.item()
+        train_loss += total_loss.item()
+        
+   
+    data_l2 /= len(train_loader)
+    train_pino /= len(train_loader)
+    train_loss /= len(train_loader)
+    scheduler.step()
+    
+    model.eval()
+    
+    test_l2 = 0.0
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.cuda(), y.cuda()
+
+            out = model(x)
+            test_l2 += myloss(out, y)
+            # test_loss.append(data_loss.item())
+
+    # train_mse /= len(train_loader)
+    # train_l2 /= ntrain
+    test_l2 /= len(test_loader)
+
+    t2 = default_timer()
+    print(f'Epoch: {ep},T:{t2-t1:.5f},train loss: {train_loss:.5f},data loss:{data_l2:.5f}, f_loss: {train_pino:.5f},test loss:{test_l2:.5f} ')
+
+
+# 'Prediction'
+print('--------------------------------------------------------------------------------')
+print('sub=1')
+index = 0
+test_e = torch.zeros(y_test.shape[0])
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=1, shuffle=False)
+with torch.no_grad():
+    for x, y in test_loader:
+        test_l2 = 0
+        x, y = x.to(device), y.to(device)
+
+        out = model(x)
+
+        test_l2 = myloss(out, y)
+        test_e[index] = test_l2
+        # print(index, test_l2)
+        index = index + 1
+
+print('Mean Error:', 100*torch.mean(test_e))
+
+print('--------------------------------------------------------------------------------')
+print('sub=2')
+index = 0
+test_e = torch.zeros(y_test[:,::2,::2].shape[0])
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test[:,::2,::2], y_test[:,::2,::2]), batch_size=1, shuffle=False)
+with torch.no_grad():
+    for x, y in test_loader:
+        test_l2 = 0
+        x, y = x.to(device), y.to(device)
+
+        out = model(x)
+
+        test_l2 = myloss(out, y)
+        test_e[index] = test_l2
+        # print(index, test_l2)
+        index = index + 1
+
+print('Mean Error:', 100*torch.mean(test_e))
+print('--------------------------------------------------------------------------------')
+print('sub=4')
+index = 0
+test_e = torch.zeros(y_test[:,::4,::4].shape[0])
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test[:,::4,::4], y_test[:,::4,::4]), batch_size=1, shuffle=False)
+with torch.no_grad():
+    for x, y in test_loader:
+        test_l2 = 0
+        x, y = x.to(device), y.to(device)
+
+        out = model(x)
+
+        test_l2 = myloss(out, y)
+        test_e[index] = test_l2
+        # print(index, test_l2)
+        index = index + 1
+
+print('Mean Error:', 100*torch.mean(test_e))
+
+
+# torch.save(model, 'model/ns_fourier_burgers')
+# pred = torch.zeros(y_test.shape)
+# index = 0
+# print('--------------------------------------------------------------------------------')
+# print('Predict')
+# index = 0
+# test_e = torch.zeros(y_test.shape[0])
+# test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=1, shuffle=False)
+# with torch.no_grad():
+#     for x, y in test_loader:
+#         test_l2 = 0
+#         x, y = x.to(device), y.to(device)
+
+#         out = model(x)
+
+#         test_l2 = myloss(out, y)
+#         test_e[index] = test_l2
+#         # print(index, test_l2)
+#         index = index + 1
+
+# print('Mean Error:', 100*torch.mean(test_e))
+# scipy.io.savemat('pred/burger_test.mat', mdict={'pred': pred.cpu().numpy()})
