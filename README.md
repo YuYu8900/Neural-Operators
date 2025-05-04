@@ -1,2 +1,2 @@
 # Neural-Operators
-Different neural operators for various numerical experiments
+Codes for Architectures, Variants, and Performance of Neural Operators: A Comparative Review
